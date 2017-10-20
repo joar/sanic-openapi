@@ -1,16 +1,25 @@
+import logging
+import json
 import re
 from itertools import repeat
+from typing import Optional, Callable, Dict, List, Tuple, Set
 
 from sanic.blueprints import Blueprint
-from sanic.response import json
+import sanic.response
 from sanic.views import CompositionView
 
-from .doc import route_specs, RouteSpec, serialize_schema, definitions
+import openapilib.helpers
+from openapilib import spec, serialize_spec
+from .doc import route_specs
 
+_log = logging.getLogger(__name__)
 
 blueprint = Blueprint('openapi', url_prefix='openapi')
 
-_spec = {}
+_SPEC = {}
+
+
+HANDLER_SPEC_ATTRIBUTE = 'operation_spec'
 
 
 # Removes all null values from a dictionary
@@ -23,23 +32,7 @@ def remove_nulls(dictionary, deep=True):
 
 
 @blueprint.listener('before_server_start')
-def build_spec(app, loop):
-    _spec['swagger'] = '2.0'
-    _spec['info'] = {
-        "version": getattr(app.config, 'API_VERSION', '1.0.0'),
-        "title": getattr(app.config, 'API_TITLE', 'API'),
-        "description": getattr(app.config, 'API_DESCRIPTION', ''),
-        "termsOfService": getattr(app.config, 'API_TERMS_OF_SERVICE', None),
-        "contact": {
-            "email": getattr(app.config, 'API_CONTACT_EMAIL', None)
-        },
-        "license": {
-            "email": getattr(app.config, 'API_LICENSE_NAME', None),
-            "url": getattr(app.config, 'API_LICENSE_URL', None)
-        }
-    }
-    _spec['schemes'] = getattr(app.config, 'API_SCHEMES', ['http'])
-
+def build_spec(app, loop=None):
     # --------------------------------------------------------------- #
     # Blueprint Tags
     # --------------------------------------------------------------- #
@@ -52,11 +45,83 @@ def build_spec(app, loop):
                 if not route_spec.tags:
                     route_spec.tags.append(blueprint.name)
 
+    path_spec, seen_tags = build_path_spec(app)
+
+    contact_spec = spec.SKIP
+    contact_email = getattr(app.config, 'API_CONTACT_EMAIL', spec.SKIP)
+    if contact_email is not spec.SKIP:
+        contact_spec = spec.Contact(
+            email=contact_email
+        )
+
+    license_spec = spec.SKIP
+    license_name = getattr(app.config, 'API_LICENSE_NAME', spec.SKIP)
+    license_url = getattr(app.config, 'API_LICENSE_URL', spec.SKIP)
+
+    if any(i is not spec.SKIP for i in (license_name, license_url)):
+        license_spec = spec.License(
+            name=license_name,
+            url=license_url,
+        )
+
+    api_spec = spec.OpenAPI(
+        info=spec.Info(
+            version=getattr(app.config, 'API_VERSION', '1.0.0'),
+            title=getattr(app.config, 'API_TITLE', 'API'),
+            description=getattr(app.config, 'API_DESCRIPTION', ''),
+            terms_of_service=getattr(app.config, 'API_TERMS_OF_SERVICE',
+                                     spec.SKIP),
+            contact=contact_spec,
+            license=license_spec,
+        ),
+        paths=path_spec,
+        components=spec.Components(),
+        # tags=[{'name': name} for name in seen_tags]
+    )
+
+    _SPEC.update(
+        serialize_spec(api_spec)
+    )
+    _log.debug(
+        'api_spec:%s', openapilib.helpers.LazyString(
+            lambda: '\n' + json.dumps(
+                serialize_spec(api_spec),
+                indent=2
+            )
+        )
+    )
+    return _SPEC
+
+
+def build_path_spec(
+        app
+) -> Tuple[
+    Dict[str, spec.PathItem],
+    Set[str]
+]:
     paths = {}
+    seen_tags = set()
+
+    blueprint_handler_tags: Dict[Callable, Set[str]] = {}
+
+    for blueprint in app.blueprints.values():
+        if hasattr(blueprint, 'routes'):
+            for route in blueprint.routes:
+                blueprint_handler_tags.setdefault(route.handler, set()).add(
+                    blueprint.name)
+
+    _log.debug(
+        'blueprint_handler_tags:%s',
+        openapilib.helpers.LazyPretty(
+            lambda: {repr(k): list(v) for k, v in
+                     blueprint_handler_tags.items()}
+        )
+    )
+
     for uri, route in app.router.routes_all.items():
         if uri.startswith("/swagger") or uri.startswith("/openapi") \
                 or '<file_uri' in uri:
-                # TODO: add static flag in sanic routes
+            # TODO: add static flag in sanic routes
             continue
 
         # --------------------------------------------------------------- #
@@ -71,100 +136,51 @@ def build_spec(app, loop):
         else:
             method_handlers = zip(route.methods, repeat(route.handler))
 
-        methods = {}
-        for _method, _handler in method_handlers:
-            route_spec = route_specs.get(_handler) or RouteSpec()
+        path_item_kwargs: Dict[str, spec.Operation] = {}
 
-            if _method == 'OPTIONS' or route_spec.exclude:
+        for method, handler in method_handlers:
+            operation_spec: Optional[spec.Operation] = getattr(
+                handler,
+                HANDLER_SPEC_ATTRIBUTE,
+                None
+            )
+            if operation_spec is None:
                 continue
 
-            consumes_content_types = route_spec.consumes_content_type or \
-                getattr(app.config, 'API_CONSUMES_CONTENT_TYPES', ['application/json'])
-            produces_content_types = route_spec.produces_content_type or \
-                getattr(app.config, 'API_PRODUCES_CONTENT_TYPES', ['application/json'])
+            path_item_kwargs[method.lower()] = operation_spec
 
-            # Parameters - Path & Query String
-            route_parameters = []
-            for parameter in route.parameters:
-                route_parameters.append({
-                    **serialize_schema(parameter.cast),
-                    'required': True,
-                    'in': 'path',
-                    'name': parameter.name
-                })
+            if operation_spec.tags is spec.SKIP:
+                # Add blueprint tag
+                _log.debug('%r %r', handler, handler in blueprint_handler_tags)
+                if handler in blueprint_handler_tags:
+                    operation_spec.add_tags(*blueprint_handler_tags[handler])
+            elif isinstance(operation_spec.tags, (list, set)):
+                seen_tags |= set(operation_spec.tags)
 
-            for consumer in route_spec.consumes:
-                spec = serialize_schema(consumer.field)
-                if 'properties' in spec:
-                    for name, prop_spec in spec['properties'].items():
-                        route_param = {
-                            **prop_spec,
-                            'required': consumer.required,
-                            'in': consumer.location,
-                            'name': name
-                        }
-                else:
-                    route_param = {
-                        **spec,
-                        'required': consumer.required,
-                        'in': consumer.location,
-                        'name': consumer.field.name if hasattr(consumer.field, 'name') else 'body'
-                    }
+            parameters: List[spec.Parameter] = []
 
-                if '$ref' in route_param:
-                    route_param["schema"] = {'$ref': route_param['$ref']}
-                    del route_param['$ref']
+            for route_parameter in route.parameters:
+                parameters.append(
+                    spec.Parameter(
+                        name=route_parameter.name,
+                        in_=spec.ParameterLocation.PATH,
+                        required=True,
+                        schema=spec.Schema.from_type(route_parameter.cast)
+                    )
+                )
 
-                route_parameters.append(route_param)
-
-            endpoint = remove_nulls({
-                'operationId': route_spec.operation or route.name,
-                'summary': route_spec.summary,
-                'description': route_spec.description,
-                'consumes': consumes_content_types,
-                'produces': produces_content_types,
-                'tags': route_spec.tags or None,
-                'parameters': route_parameters,
-                'responses': {
-                    "200": {
-                        "description": None,
-                        "examples": None,
-                        "schema": serialize_schema(route_spec.produces) if route_spec.produces else None
-                    }
-                },
-            })
-
-            methods[_method.lower()] = endpoint
+            operation_spec.parameters = parameters
 
         uri_parsed = uri
-        for parameter in route.parameters:
-            uri_parsed = re.sub('<'+parameter.name+'.*?>', '{'+parameter.name+'}', uri_parsed)
+        for route_parameter in route.parameters:
+            uri_parsed = re.sub('<' + route_parameter.name + '.*?>',
+                                '{' + route_parameter.name + '}', uri_parsed)
 
-        paths[uri_parsed] = methods
+        paths[uri_parsed] = spec.PathItem(**path_item_kwargs)
 
-    # --------------------------------------------------------------- #
-    # Definitions
-    # --------------------------------------------------------------- #
-
-    _spec['definitions'] = {obj.object_name: definition for cls, (obj, definition) in definitions.items()}
-
-    # --------------------------------------------------------------- #
-    # Tags
-    # --------------------------------------------------------------- #
-
-    # TODO: figure out how to get descriptions in these
-    tags = {}
-    for route_spec in route_specs.values():
-        if route_spec.blueprint and route_spec.blueprint.name in ('swagger', 'openapi'):
-                # TODO: add static flag in sanic routes
-            continue
-        for tag in route_spec.tags:
-            tags[tag] = True
-    _spec['tags'] = [{"name": name} for name in tags.keys()]
-
-    _spec['paths'] = paths
+    return paths, seen_tags
 
 
 @blueprint.route('/spec.json')
-def spec(request):
-    return json(_spec)
+def get_spec(request):
+    return sanic.response.json(_SPEC)
