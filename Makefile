@@ -10,4 +10,5 @@ update-swagger-ui:
 			--strip-components=2 \
 			-C $(SWAGGER_UI_DIR) \
 			-vzx \
-			--exclude $(SWAGGER_UI_EXCLUDE)
+			$(SWAGGER_UI_DIST_PATH)
+			# --exclude $(SWAGGER_UI_EXCLUDE)
