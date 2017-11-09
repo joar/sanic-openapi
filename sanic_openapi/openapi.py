@@ -2,11 +2,13 @@ import logging
 import json
 import re
 from itertools import repeat
-from typing import Optional, Callable, Dict, List, Tuple, Set
+from typing import Optional, Callable, Dict, List, Tuple, Set, Type
 
+from sanic import Sanic
 from sanic.blueprints import Blueprint
 import sanic.response
-from sanic.views import CompositionView
+from sanic.constants import HTTP_METHODS
+from sanic.views import CompositionView, HTTPMethodView
 
 import openapilib.helpers
 from openapilib import spec, serialize_spec
@@ -17,6 +19,10 @@ _log = logging.getLogger(__name__)
 blueprint = Blueprint('openapi', url_prefix='openapi')
 
 _SPEC = {}
+
+
+def is_debug() -> bool:
+    return logging.NOTSET < _log.level < logging.INFO
 
 
 HANDLER_SPEC_ATTRIBUTE = 'operation_spec'
@@ -32,11 +38,7 @@ def remove_nulls(dictionary, deep=True):
 
 
 @blueprint.listener('before_server_start')
-def build_spec(app, loop=None):
-    # --------------------------------------------------------------- #
-    # Blueprint Tags
-    # --------------------------------------------------------------- #
-
+def build_spec(app: Sanic, loop=None):
     for blueprint in app.blueprints.values():
         if hasattr(blueprint, 'routes'):
             for route in blueprint.routes:
@@ -94,7 +96,7 @@ def build_spec(app, loop=None):
 
 
 def build_path_spec(
-        app
+        app: Sanic
 ) -> Tuple[
     Dict[str, spec.PathItem],
     Set[str]
@@ -118,10 +120,19 @@ def build_path_spec(
         )
     )
 
-    for uri, route in app.router.routes_all.items():
+    all_routes = app.router.routes_all
+    _log.debug(
+        'all_routes:%s',
+        openapilib.helpers.Pretty(all_routes)
+    )
+    # Should not be used unless app.debug
+    _uri_method_handlers = {}
+
+    for uri, route in all_routes.items():
         if uri.startswith("/swagger") or uri.startswith("/openapi") \
                 or '<file_uri' in uri:
             # TODO: add static flag in sanic routes
+            _log.info('skipping uri %r', uri)
             continue
 
         # --------------------------------------------------------------- #
@@ -129,12 +140,14 @@ def build_path_spec(
         # --------------------------------------------------------------- #
 
         # Build list of methods and their handler functions
-        handler_type = type(route.handler)
-        if handler_type is CompositionView:
+        if isinstance(route.handler,  CompositionView):
             view = route.handler
             method_handlers = view.handlers.items()
         else:
             method_handlers = zip(route.methods, repeat(route.handler))
+
+        if is_debug():
+            _uri_method_handlers[uri] = dict(method_handlers)
 
         path_item_kwargs: Dict[str, spec.Operation] = {}
 
@@ -145,13 +158,18 @@ def build_path_spec(
                 None
             )
             if operation_spec is None:
+                _log.debug(
+                    'handler %r for %r %r has no operation_spec',
+                    handler,
+                    uri,
+                    method,
+                )
                 continue
 
             path_item_kwargs[method.lower()] = operation_spec
 
             if operation_spec.tags is spec.SKIP:
                 # Add blueprint tag
-                _log.debug('%r %r', handler, handler in blueprint_handler_tags)
                 if handler in blueprint_handler_tags:
                     operation_spec.add_tags(*blueprint_handler_tags[handler])
             elif isinstance(operation_spec.tags, (list, set)):
@@ -178,7 +196,14 @@ def build_path_spec(
 
         paths[uri_parsed] = spec.PathItem(**path_item_kwargs)
 
+    if is_debug():
+        _log.debug(
+            'uri_method_handlers:%s',
+            openapilib.helpers.Pretty(_uri_method_handlers)
+        )
+
     return paths, seen_tags
+
 
 
 @blueprint.route('/spec.json')
